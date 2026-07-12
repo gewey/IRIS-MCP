@@ -67,7 +67,9 @@ PRICING = {
 # Ratio input:output = 7.2:1 -> ~42.5x and ~97.6% savings with current pricing.
 CLAIM_ASSUMPTIONS = {"input_tokens": 720_000, "output_tokens": 100_000}
 COMMAND_PATTERN = re.compile(r"^(READ|SEARCH|UPDATE)\s*:?\s+(.+)$", re.IGNORECASE)
+# Prevents division-by-zero when reporting cost-effectiveness ratios.
 MIN_COST_DIVISOR = 1e-6
+MAX_FALLBACK_QUERY_LENGTH = 400
 
 
 def _compute_costs(input_tokens: int, output_tokens: int) -> tuple[float, float, float, float]:
@@ -101,8 +103,8 @@ def _enforce_command_format(raw_text: str, user_chat: str) -> str:
     if commands:
         return "\n".join(commands)
 
-    fallback_query = re.sub(r"[^\w\s.,:;!?@#%&()/+-]", " ", user_chat)
-    fallback_query = re.sub(r"\s+", " ", fallback_query).strip()[:400]
+    fallback_query = re.sub(r"[^\w\s.,:;!?-]", " ", user_chat)
+    fallback_query = re.sub(r"\s+", " ", fallback_query).strip()[:MAX_FALLBACK_QUERY_LENGTH]
     return (
         "READ: Inspect the primary files that control the requested behavior.\n"
         f"SEARCH: Locate all logic tied to {fallback_query}.\n"
