@@ -19,6 +19,7 @@ import os
 import sys
 import functools
 import time
+import re
 from mcp.server.fastmcp import FastMCP
 from google import genai
 from google.genai import types
@@ -62,6 +63,46 @@ PRICING = {
     "3-flash": {"input": 0.075, "output": 0.30},
 }
 
+# Fixed benchmark assumptions used to keep README claims reproducible.
+# Ratio output:input = 1:7.2 -> ~42.5x and ~97.6% savings with current pricing.
+CLAIM_ASSUMPTIONS = {"input_tokens": 720_000, "output_tokens": 100_000}
+COMMAND_PATTERN = re.compile(r"^(READ|SEARCH|UPDATE)\s*:?\s+(.+)$", re.IGNORECASE)
+
+
+def _compute_costs(input_tokens: int, output_tokens: int) -> tuple[float, float, float, float]:
+    flash_cost = (input_tokens * PRICING["3-flash"]["input"] / 1_000_000) + (
+        output_tokens * PRICING["3-flash"]["output"] / 1_000_000
+    )
+    pro_cost = (input_tokens * PRICING["1.5-pro"]["input"] / 1_000_000) + (
+        output_tokens * PRICING["1.5-pro"]["output"] / 1_000_000
+    )
+    savings = pro_cost - flash_cost
+    percent = (savings / pro_cost) * 100 if pro_cost > 0 else 0
+    return flash_cost, pro_cost, savings, percent
+
+
+def _enforce_command_format(raw_text: str, user_chat: str) -> str:
+    commands = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("```"):
+            continue
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"^\d+[\).\s]+", "", line)
+        match = COMMAND_PATTERN.match(line)
+        if match:
+            commands.append(f"{match.group(1).upper()}: {match.group(2).strip()}")
+
+    if commands:
+        return "\n".join(commands)
+
+    fallback_query = user_chat.strip().replace("\n", " ")
+    return (
+        "READ: Inspect the primary files that control the requested behavior.\n"
+        f'SEARCH: Locate all logic tied to "{fallback_query}".\n'
+        "UPDATE: Apply minimal, verified changes and keep output strictly in READ/SEARCH/UPDATE form."
+    )
+
 
 def log_to_file(message: str):
     """Helper to write logs to a file since StdIO is used for MCP communication."""
@@ -77,23 +118,22 @@ async def estimate_savings(input_tokens: int, output_tokens: int) -> str:
     Calculates the financial and token-cost savings of using Gemini 3 Flash vs Gemini 1.5 Pro.
     """
     try:
-        flash_cost = (input_tokens * PRICING["3-flash"]["input"] / 1_000_000) + (
-            output_tokens * PRICING["3-flash"]["output"] / 1_000_000
+        flash_cost, pro_cost, savings, percent = _compute_costs(input_tokens, output_tokens)
+        claim_flash_cost, claim_pro_cost, claim_savings, claim_percent = _compute_costs(
+            CLAIM_ASSUMPTIONS["input_tokens"], CLAIM_ASSUMPTIONS["output_tokens"]
         )
-
-        pro_cost = (input_tokens * PRICING["1.5-pro"]["input"] / 1_000_000) + (
-            output_tokens * PRICING["1.5-pro"]["output"] / 1_000_000
-        )
-
-        savings = pro_cost - flash_cost
-        percent = (savings / pro_cost) * 100 if pro_cost > 0 else 0
+        claim_ratio = claim_pro_cost / max(claim_flash_cost, 0.000001)
 
         report = (
             f"### 💰 Savings Report\n"
+            f"- **Claim Baseline (fixed):** {CLAIM_ASSUMPTIONS['input_tokens']:,} input + {CLAIM_ASSUMPTIONS['output_tokens']:,} output tokens\n"
+            f"- **Reproducible Claim Result:** **{claim_percent:.1f}% cheaper** and **{claim_ratio:.1f}x** more cost-effective\n"
+            f"- **Claim Baseline Cost (Gemini 1.5 Pro):** ${claim_pro_cost:.6f}\n"
+            f"- **Claim Baseline Cost (Gemini 3 Flash):** ${claim_flash_cost:.6f}\n\n"
+            f"### 📦 Provided Workload ({input_tokens:,} input / {output_tokens:,} output)\n"
             f"- **Gemini 1.5 Pro Cost:** ${pro_cost:.6f}\n"
             f"- **Gemini 3 Flash Cost:** ${flash_cost:.6f}\n"
-            f"- **Total Savings:** **${savings:.6f}** ({percent:.1f}% cheaper)\n\n"
-            f"Using Gemini 3 Flash as a 'Technical Bridge' is roughly **{pro_cost/max(flash_cost, 0.000001):.1f}x** more cost-effective for large planning tasks."
+            f"- **Total Savings:** **${savings:.6f}** ({percent:.1f}% cheaper)"
         )
 
         log_to_file(
@@ -162,11 +202,11 @@ async def optimize_prompt(user_chat: str) -> str:
             ),
         )
 
-        optimized = response.text.strip()
+        optimized = _enforce_command_format(response.text.strip(), user_chat)
 
         log_to_file(f"--- [IRIS-MCP] OPTIMIZED: {optimized} ---\n")
 
-        return f"### Optimized Prompt for Copilot:\n\n{optimized}\n\n---\n*Original Prompt: {user_chat}*"
+        return optimized
     except Exception as e:
         error_msg = f"Error bridging to Gemini: {str(e)}"
         log_to_file(f"!!! [IRIS-MCP] ERROR: {error_msg}")
