@@ -19,6 +19,8 @@ import os
 import sys
 import functools
 import time
+import re
+import threading
 from mcp.server.fastmcp import FastMCP
 from google import genai
 from google.genai import types
@@ -32,6 +34,9 @@ mcp = FastMCP("IRIS-MCP")
 
 # Metrics storage
 _METRICS = {"calls": 0, "errors": 0, "total_time": 0.0}
+TOKEN_MILESTONE_STEP = 100
+_TOKEN_SPEND_STATE = {"total": 0, "next_milestone": TOKEN_MILESTONE_STEP}
+_TOKEN_SPEND_LOCK = threading.Lock()
 
 
 def track_performance(func):
@@ -62,6 +67,95 @@ PRICING = {
     "3-flash": {"input": 0.075, "output": 0.30},
 }
 
+# Fixed benchmark assumptions used to keep README claims reproducible.
+# With current PRICING, input:output token ratio = 7.2:1 yields a Pro/Flash cost ratio of ~42.5x.
+# Savings percentage is derived as (1 - 1/ratio) * 100 => ~97.6%.
+# 720k/100k is the concrete token pair for that ratio.
+CLAIM_ASSUMPTIONS = {"input_tokens": 720_000, "output_tokens": 100_000}
+# Colon is required to enforce strict command formatting.
+COMMAND_PATTERN = re.compile(r"^(READ|SEARCH|UPDATE)\s*:\s+(.+)$", re.IGNORECASE)
+# Prevents division-by-zero when reporting cost-effectiveness ratios.
+MIN_COST_DIVISOR = 1e-6
+MAX_FALLBACK_QUERY_LENGTH = 400
+FALLBACK_READ_COMMAND = "READ: Inspect the primary files that control the requested behavior."
+FALLBACK_UPDATE_COMMAND = (
+    "UPDATE: Apply minimal, verified changes and keep output strictly in READ/SEARCH/UPDATE form."
+)
+
+
+def _compute_costs(input_tokens: int, output_tokens: int) -> tuple[float, float, float, float]:
+    flash_cost = (input_tokens * PRICING["3-flash"]["input"] / 1_000_000) + (
+        output_tokens * PRICING["3-flash"]["output"] / 1_000_000
+    )
+    pro_cost = (input_tokens * PRICING["1.5-pro"]["input"] / 1_000_000) + (
+        output_tokens * PRICING["1.5-pro"]["output"] / 1_000_000
+    )
+    savings = pro_cost - flash_cost
+    percent = (savings / pro_cost) * 100 if pro_cost > 0 else 0
+    return flash_cost, pro_cost, savings, percent
+
+
+def _safe_cost_ratio(numerator: float, denominator: float) -> float:
+    return numerator / max(denominator, MIN_COST_DIVISOR)
+
+
+def _extract_total_tokens(response) -> int:
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if usage_metadata is None:
+        return 0
+
+    total_token_count = getattr(usage_metadata, "total_token_count", None)
+    if isinstance(total_token_count, int):
+        return total_token_count
+
+    prompt_token_count = getattr(usage_metadata, "prompt_token_count", 0) or 0
+    candidates_token_count = getattr(usage_metadata, "candidates_token_count", 0) or 0
+    return int(prompt_token_count + candidates_token_count)
+
+
+def _log_token_milestones(tokens_spent: int):
+    if tokens_spent <= 0:
+        return
+
+    milestones_to_log = []
+    with _TOKEN_SPEND_LOCK:
+        _TOKEN_SPEND_STATE["total"] += tokens_spent
+        while _TOKEN_SPEND_STATE["total"] >= _TOKEN_SPEND_STATE["next_milestone"]:
+            milestones_to_log.append(_TOKEN_SPEND_STATE["next_milestone"])
+            _TOKEN_SPEND_STATE["next_milestone"] += TOKEN_MILESTONE_STEP
+
+    for milestone in milestones_to_log:
+        log_to_file(str(milestone))
+
+
+def _enforce_command_format(raw_text: str, user_chat: str) -> str:
+    commands = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("```"):
+            continue
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"^\d+[\).\s]+", "", line)
+        match = COMMAND_PATTERN.match(line)
+        if match:
+            commands.append(f"{match.group(1).upper()}: {match.group(2).strip()}")
+
+    if commands:
+        return "\n".join(commands)
+
+    sanitized_query = re.sub(r"[^\w\s._/-]", " ", user_chat)
+    normalized_query = re.sub(r"\s+", " ", sanitized_query).strip()
+    was_truncated = len(normalized_query) > MAX_FALLBACK_QUERY_LENGTH
+    fallback_query = normalized_query[:MAX_FALLBACK_QUERY_LENGTH]
+    if was_truncated:
+        # Keep the truncated value if there is no word boundary to split on.
+        fallback_query = fallback_query.rsplit(" ", 1)[0] or fallback_query
+    return (
+        f"{FALLBACK_READ_COMMAND}\n"
+        + f"SEARCH: Locate all logic tied to {fallback_query}.\n"
+        + FALLBACK_UPDATE_COMMAND
+    )
+
 
 def log_to_file(message: str):
     """Helper to write logs to a file since StdIO is used for MCP communication."""
@@ -77,23 +171,22 @@ async def estimate_savings(input_tokens: int, output_tokens: int) -> str:
     Calculates the financial and token-cost savings of using Gemini 3 Flash vs Gemini 1.5 Pro.
     """
     try:
-        flash_cost = (input_tokens * PRICING["3-flash"]["input"] / 1_000_000) + (
-            output_tokens * PRICING["3-flash"]["output"] / 1_000_000
+        flash_cost, pro_cost, savings, percent = _compute_costs(input_tokens, output_tokens)
+        claim_flash_cost, claim_pro_cost, claim_savings, claim_percent = _compute_costs(
+            CLAIM_ASSUMPTIONS["input_tokens"], CLAIM_ASSUMPTIONS["output_tokens"]
         )
-
-        pro_cost = (input_tokens * PRICING["1.5-pro"]["input"] / 1_000_000) + (
-            output_tokens * PRICING["1.5-pro"]["output"] / 1_000_000
-        )
-
-        savings = pro_cost - flash_cost
-        percent = (savings / pro_cost) * 100 if pro_cost > 0 else 0
+        claim_ratio = _safe_cost_ratio(claim_pro_cost, claim_flash_cost)
 
         report = (
             f"### 💰 Savings Report\n"
+            f"- **Claim Baseline (fixed):** {CLAIM_ASSUMPTIONS['input_tokens']:,} input + {CLAIM_ASSUMPTIONS['output_tokens']:,} output tokens\n"
+            f"- **Reproducible Claim Result:** **{claim_percent:.1f}% cheaper** and **{claim_ratio:.1f}x** more cost-effective\n"
+            f"- **Claim Baseline Cost (Gemini 1.5 Pro):** ${claim_pro_cost:.6f}\n"
+            f"- **Claim Baseline Cost (Gemini 3 Flash):** ${claim_flash_cost:.6f}\n\n"
+            f"### 📦 Provided Workload ({input_tokens:,} input / {output_tokens:,} output)\n"
             f"- **Gemini 1.5 Pro Cost:** ${pro_cost:.6f}\n"
             f"- **Gemini 3 Flash Cost:** ${flash_cost:.6f}\n"
-            f"- **Total Savings:** **${savings:.6f}** ({percent:.1f}% cheaper)\n\n"
-            f"Using Gemini 3 Flash as a 'Technical Bridge' is roughly **{pro_cost/max(flash_cost, 0.000001):.1f}x** more cost-effective for large planning tasks."
+            f"- **Total Savings:** **${savings:.6f}** ({percent:.1f}% cheaper)"
         )
 
         log_to_file(
@@ -161,12 +254,13 @@ async def optimize_prompt(user_chat: str) -> str:
                 temperature=0.2,
             ),
         )
+        _log_token_milestones(_extract_total_tokens(response))
 
-        optimized = response.text.strip()
+        optimized = _enforce_command_format(response.text.strip(), user_chat)
 
         log_to_file(f"--- [IRIS-MCP] OPTIMIZED: {optimized} ---\n")
 
-        return f"### Optimized Prompt for Copilot:\n\n{optimized}\n\n---\n*Original Prompt: {user_chat}*"
+        return optimized
     except Exception as e:
         error_msg = f"Error bridging to Gemini: {str(e)}"
         log_to_file(f"!!! [IRIS-MCP] ERROR: {error_msg}")
