@@ -20,6 +20,7 @@ import sys
 import functools
 import time
 import re
+import threading
 from mcp.server.fastmcp import FastMCP
 from google import genai
 from google.genai import types
@@ -33,6 +34,9 @@ mcp = FastMCP("IRIS-MCP")
 
 # Metrics storage
 _METRICS = {"calls": 0, "errors": 0, "total_time": 0.0}
+TOKEN_MILESTONE_STEP = 100
+_TOKEN_SPEND_STATE = {"total": 0, "next_milestone": TOKEN_MILESTONE_STEP}
+_TOKEN_SPEND_LOCK = threading.Lock()
 
 
 def track_performance(func):
@@ -93,6 +97,35 @@ def _compute_costs(input_tokens: int, output_tokens: int) -> tuple[float, float,
 
 def _safe_cost_ratio(numerator: float, denominator: float) -> float:
     return numerator / max(denominator, MIN_COST_DIVISOR)
+
+
+def _extract_total_tokens(response) -> int:
+    usage_metadata = getattr(response, "usage_metadata", None)
+    if usage_metadata is None:
+        return 0
+
+    total_token_count = getattr(usage_metadata, "total_token_count", None)
+    if isinstance(total_token_count, int):
+        return total_token_count
+
+    prompt_token_count = getattr(usage_metadata, "prompt_token_count", 0) or 0
+    candidates_token_count = getattr(usage_metadata, "candidates_token_count", 0) or 0
+    return int(prompt_token_count + candidates_token_count)
+
+
+def _log_token_milestones(tokens_spent: int):
+    if tokens_spent <= 0:
+        return
+
+    milestones_to_log = []
+    with _TOKEN_SPEND_LOCK:
+        _TOKEN_SPEND_STATE["total"] += tokens_spent
+        while _TOKEN_SPEND_STATE["total"] >= _TOKEN_SPEND_STATE["next_milestone"]:
+            milestones_to_log.append(_TOKEN_SPEND_STATE["next_milestone"])
+            _TOKEN_SPEND_STATE["next_milestone"] += TOKEN_MILESTONE_STEP
+
+    for milestone in milestones_to_log:
+        log_to_file(str(milestone))
 
 
 def _enforce_command_format(raw_text: str, user_chat: str) -> str:
@@ -221,6 +254,7 @@ async def optimize_prompt(user_chat: str) -> str:
                 temperature=0.2,
             ),
         )
+        _log_token_milestones(_extract_total_tokens(response))
 
         optimized = _enforce_command_format(response.text.strip(), user_chat)
 
