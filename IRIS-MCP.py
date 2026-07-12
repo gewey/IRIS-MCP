@@ -67,7 +67,7 @@ PRICING = {
 # Ratio input:output = 7.2:1 -> ~42.5x and ~97.6% savings with current pricing.
 CLAIM_ASSUMPTIONS = {"input_tokens": 720_000, "output_tokens": 100_000}
 COMMAND_PATTERN = re.compile(r"^(READ|SEARCH|UPDATE)\s*:?\s+(.+)$", re.IGNORECASE)
-EPSILON = 1e-6
+MIN_COST_DIVISOR = 1e-6
 
 
 def _compute_costs(input_tokens: int, output_tokens: int) -> tuple[float, float, float, float]:
@@ -80,6 +80,10 @@ def _compute_costs(input_tokens: int, output_tokens: int) -> tuple[float, float,
     savings = pro_cost - flash_cost
     percent = (savings / pro_cost) * 100 if pro_cost > 0 else 0
     return flash_cost, pro_cost, savings, percent
+
+
+def _safe_cost_ratio(numerator: float, denominator: float) -> float:
+    return numerator / max(denominator, MIN_COST_DIVISOR)
 
 
 def _enforce_command_format(raw_text: str, user_chat: str) -> str:
@@ -97,11 +101,11 @@ def _enforce_command_format(raw_text: str, user_chat: str) -> str:
     if commands:
         return "\n".join(commands)
 
-    fallback_query = re.sub(r"[^\w\s.,:;!?@#%&()'\"/+-]", " ", user_chat)
+    fallback_query = re.sub(r"[^\w\s.,:;!?@#%&()/+-]", " ", user_chat)
     fallback_query = re.sub(r"\s+", " ", fallback_query).strip()[:400]
     return (
         "READ: Inspect the primary files that control the requested behavior.\n"
-        f'SEARCH: Locate all logic tied to "{fallback_query}".\n'
+        f"SEARCH: Locate all logic tied to {fallback_query}.\n"
         "UPDATE: Apply minimal, verified changes and keep output strictly in READ/SEARCH/UPDATE form."
     )
 
@@ -124,7 +128,7 @@ async def estimate_savings(input_tokens: int, output_tokens: int) -> str:
         claim_flash_cost, claim_pro_cost, claim_savings, claim_percent = _compute_costs(
             CLAIM_ASSUMPTIONS["input_tokens"], CLAIM_ASSUMPTIONS["output_tokens"]
         )
-        claim_ratio = claim_pro_cost / max(claim_flash_cost, EPSILON)
+        claim_ratio = _safe_cost_ratio(claim_pro_cost, claim_flash_cost)
 
         report = (
             f"### 💰 Savings Report\n"
