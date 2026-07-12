@@ -110,11 +110,12 @@ def _enforce_command_format(raw_text: str, user_chat: str) -> str:
     if commands:
         return "\n".join(commands)
 
-    sanitized_query = re.sub(r"[^\w\s._/\-]", " ", user_chat)
+    sanitized_query = re.sub(r"[^\w\s._/-]", " ", user_chat)
     normalized_query = re.sub(r"\s+", " ", sanitized_query).strip()
     was_truncated = len(normalized_query) > MAX_FALLBACK_QUERY_LENGTH
     fallback_query = normalized_query[:MAX_FALLBACK_QUERY_LENGTH]
     if was_truncated:
+        # Keep the truncated value if there is no word boundary to split on.
         fallback_query = fallback_query.rsplit(" ", 1)[0] or fallback_query
     return (
         f"{FALLBACK_READ_COMMAND}\n"
