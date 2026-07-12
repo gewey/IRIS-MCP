@@ -64,7 +64,7 @@ PRICING = {
 }
 
 # Fixed benchmark assumptions used to keep README claims reproducible.
-# With current PRICING, input:output = 7.2:1 yields a Pro/Flash cost ratio of ~42.5x.
+# With current PRICING, input:output token ratio = 7.2:1 yields a Pro/Flash cost ratio of ~42.5x.
 # Savings percentage is derived as (1 - 1/ratio) * 100 => ~97.6%.
 CLAIM_ASSUMPTIONS = {"input_tokens": 720_000, "output_tokens": 100_000}
 COMMAND_PATTERN = re.compile(r"^(READ|SEARCH|UPDATE)\s*:?\s+(.+)$", re.IGNORECASE)
@@ -104,10 +104,11 @@ def _enforce_command_format(raw_text: str, user_chat: str) -> str:
     if commands:
         return "\n".join(commands)
 
-    fallback_query = re.sub(r"[^\w\s]", " ", user_chat)
-    fallback_query = re.sub(r"\s+", " ", fallback_query).strip()
-    fallback_query = fallback_query[:MAX_FALLBACK_QUERY_LENGTH]
-    if len(fallback_query) == MAX_FALLBACK_QUERY_LENGTH:
+    sanitized_query = re.sub(r"[^\w\s]", " ", user_chat)
+    normalized_query = re.sub(r"\s+", " ", sanitized_query).strip()
+    was_truncated = len(normalized_query) > MAX_FALLBACK_QUERY_LENGTH
+    fallback_query = normalized_query[:MAX_FALLBACK_QUERY_LENGTH]
+    if was_truncated:
         fallback_query = fallback_query.rsplit(" ", 1)[0] or fallback_query
     return (
         "READ: Inspect the primary files that control the requested behavior.\n"
