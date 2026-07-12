@@ -64,9 +64,10 @@ PRICING = {
 }
 
 # Fixed benchmark assumptions used to keep README claims reproducible.
-# Ratio output:input = 1:7.2 -> ~42.5x and ~97.6% savings with current pricing.
+# Ratio input:output = 7.2:1 -> ~42.5x and ~97.6% savings with current pricing.
 CLAIM_ASSUMPTIONS = {"input_tokens": 720_000, "output_tokens": 100_000}
 COMMAND_PATTERN = re.compile(r"^(READ|SEARCH|UPDATE)\s*:?\s+(.+)$", re.IGNORECASE)
+EPSILON = 1e-6
 
 
 def _compute_costs(input_tokens: int, output_tokens: int) -> tuple[float, float, float, float]:
@@ -96,7 +97,8 @@ def _enforce_command_format(raw_text: str, user_chat: str) -> str:
     if commands:
         return "\n".join(commands)
 
-    fallback_query = user_chat.strip().replace("\n", " ")
+    fallback_query = re.sub(r"[^\w\s.,:;!?@#%&()'\"/+-]", " ", user_chat)
+    fallback_query = re.sub(r"\s+", " ", fallback_query).strip()[:400]
     return (
         "READ: Inspect the primary files that control the requested behavior.\n"
         f'SEARCH: Locate all logic tied to "{fallback_query}".\n'
@@ -122,7 +124,7 @@ async def estimate_savings(input_tokens: int, output_tokens: int) -> str:
         claim_flash_cost, claim_pro_cost, claim_savings, claim_percent = _compute_costs(
             CLAIM_ASSUMPTIONS["input_tokens"], CLAIM_ASSUMPTIONS["output_tokens"]
         )
-        claim_ratio = claim_pro_cost / max(claim_flash_cost, 0.000001)
+        claim_ratio = claim_pro_cost / max(claim_flash_cost, EPSILON)
 
         report = (
             f"### 💰 Savings Report\n"
