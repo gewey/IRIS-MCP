@@ -1,0 +1,12 @@
+{
+    "hooks": {
+        "UserPromptSubmit": [
+            {
+                "type": "command",
+                "command": "& \"${workspaceFolder}/venv/Scripts/python.exe\" ${workspaceFolder}/.github/hooks/IRIS-MCP_hook.py",
+                "windows": "& \"${workspaceFolder}/venv/Scripts/python.exe\" ${workspaceFolder}/.github/hooks/IRIS-MCP_hook.py",
+                "timeout": 15
+            }
+        ]
+    }
+}
